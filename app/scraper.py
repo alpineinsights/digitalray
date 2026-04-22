@@ -78,13 +78,47 @@ async def _log_in(page) -> None:
     await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
 
     # --- Step 1: click "Log In" on digitalray.ai landing page ---
-    logger.info("Clicking 'Log In' link on landing page")
-    try:
-        await page.get_by_text("Log In", exact=True).first.click(timeout=15000)
-    except PlaywrightTimeout:
+    # The landing page is a Vue.js SPA - give it extra time to finish
+    # rendering all interactive elements after network settles.
+    logger.info("Waiting for landing page to fully render")
+    await page.wait_for_timeout(3000)
+
+    logger.info("Looking for 'Log In' link on landing page")
+
+    # Try multiple strategies in order from most specific to most permissive.
+    # First match wins. This is resilient to case/whitespace/tag variations.
+    login_locators = [
+        page.get_by_role("link", name="Log In"),
+        page.get_by_role("button", name="Log In"),
+        page.get_by_text("Log In", exact=True),
+        page.locator("text=/^\\s*Log In\\s*$/i"),  # case-insensitive, ignore whitespace
+        page.locator("a:has-text('Log In'), button:has-text('Log In')"),
+        page.get_by_text("Login", exact=False),  # last resort: any element containing "Login"
+    ]
+
+    clicked = False
+    for i, locator in enumerate(login_locators):
+        try:
+            await locator.first.click(timeout=5000)
+            logger.info(f"Clicked login link using strategy #{i + 1}")
+            clicked = True
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        # Dump the visible text of the page to logs so we can see what's there.
+        # This will help us debug if all strategies fail.
+        try:
+            body_text = await page.locator("body").inner_text()
+            # Only log first 2000 chars to avoid flooding
+            logger.error(f"Page body text (first 2000 chars): {body_text[:2000]}")
+        except Exception:
+            pass
         raise RuntimeError(
-            f"Couldn't find 'Log In' link on digitalray.ai landing page. "
-            f"Current URL: {page.url}"
+            f"Couldn't find 'Log In' link on digitalray.ai landing page using "
+            f"any of 6 strategies. Current URL: {page.url}. See prior log line "
+            f"for visible page text."
         )
 
     # --- Step 2: wait for principlesyou.com Welcome Back page ---

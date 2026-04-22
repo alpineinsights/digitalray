@@ -167,44 +167,82 @@ async def _log_in(page) -> None:
     logger.info("Filling email address")
     await page.fill(EMAIL_INPUT, settings.digitalray_email)
 
+    # Capture URL before submit so we can detect the navigation
+    url_before_email_submit = page.url
+
     logger.info("Clicking CONTINUE on email page")
     await _click_continue(page)
 
-    # --- Step 6: wait for Enter Your Password page ---
-    logger.info("Waiting for password page")
+    # --- Step 6: wait for navigation AND password field ---
+    logger.info("Waiting for password page to load")
     try:
-        await page.wait_for_selector(PASSWORD_INPUT, timeout=20000, state="visible")
+        # Wait for URL to change (meaning navigation actually happened)
+        await page.wait_for_function(
+            f"() => window.location.href !== {url_before_email_submit!r}",
+            timeout=15000,
+        )
+        # Then wait for network to settle on the new page
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        # Then wait for the password input to be visible
+        await page.wait_for_selector(PASSWORD_INPUT, timeout=15000, state="visible")
+        logger.info(f"Password page loaded. Current URL: {page.url}")
     except PlaywrightTimeout:
         raise RuntimeError(
             f"Password page never appeared after clicking CONTINUE. "
             f"Current URL: {page.url}. Possible causes: wrong email, "
-            f"Terms checkbox wasn't ticked, or CONTINUE button selector is wrong."
+            f"Terms checkbox not ticked, or CONTINUE didn't actually submit."
         )
 
     # --- Step 7: fill password and click CONTINUE ---
     logger.info("Filling password")
     await page.fill(PASSWORD_INPUT, settings.digitalray_password)
 
+    # Capture URL before password submit
+    url_before_password_submit = page.url
+
     logger.info("Clicking CONTINUE on password page")
     await _click_continue(page)
 
-    # --- Step 8: wait for redirect to authenticated digitalray.ai ---
-    # We want /home (not /login, not /guest). /guest means auth silently failed.
-    logger.info("Waiting for redirect to authenticated digitalray.ai")
+    # --- Step 8: wait for navigation away from principlesyou.com ---
+    logger.info("Waiting for redirect away from principlesyou.com")
     try:
-        await page.wait_for_url(
-            lambda url: "digitalray.ai" in url
-                        and "/guest" not in url
-                        and "/login" not in url,
-            timeout=30000,
+        await page.wait_for_function(
+            f"() => window.location.href !== {url_before_password_submit!r}",
+            timeout=15000,
         )
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        logger.info(f"Navigation happened. Current URL: {page.url}")
     except PlaywrightTimeout:
+        # Dump body text to see any error message on the password page
+        try:
+            body_text = await page.locator("body").inner_text()
+            logger.error(f"Password page body text: {body_text[:2000]}")
+        except Exception:
+            pass
         raise RuntimeError(
-            f"Login submit didn't redirect to authenticated digitalray.ai. "
+            f"Password CONTINUE didn't trigger any navigation. "
             f"Current URL: {page.url}. Possible causes: wrong password, "
-            f"2FA required, or email verification needed."
+            f"CONTINUE button didn't actually submit, or validation error."
         )
+
+    # --- Step 9: confirm we're on authenticated digitalray.ai ---
+    if "digitalray.ai" not in page.url or "/guest" in page.url or "/login" in page.url:
+        # We navigated, but not to where we wanted. Wait a bit more in case
+        # there's a chain of redirects still in progress.
+        try:
+            await page.wait_for_url(
+                lambda url: "digitalray.ai" in url
+                            and "/guest" not in url
+                            and "/login" not in url,
+                timeout=20000,
+            )
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeout:
+            raise RuntimeError(
+                f"Navigated, but not to authenticated digitalray.ai. "
+                f"Current URL: {page.url}. Possible cause: authentication "
+                f"silently failed and we fell to guest mode or an error page."
+            )
 
     logger.info(f"Login successful. Current URL: {page.url}")
 

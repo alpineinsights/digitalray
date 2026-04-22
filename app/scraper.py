@@ -68,30 +68,23 @@ async def _log_in(page) -> None:
     """
     Performs the full authenticated login flow.
 
-    Pages visited:
-      1. digitalray.ai/login  (click "Log In" link, NOT "Chat with Digital Ray")
-      2. principlesyou.com Welcome Back page (tick Terms checkbox, fill email, CONTINUE)
-      3. principlesyou.com Enter Password page (fill password, CONTINUE)
-      4. digitalray.ai/home  (authenticated, ready to chat)
+    Navigation path:
+      1. Navigate directly to digitalray.ai/guest (contains the Log In link)
+      2. Click "Log In" (via user avatar dropdown OR sidebar - both tried)
+      3. principlesyou.com Welcome Back page: tick Terms checkbox, fill
+         email, click CONTINUE
+      4. principlesyou.com Enter Password page: fill password, click CONTINUE
+      5. Redirect back to digitalray.ai/home (authenticated, ready to chat)
     """
-    logger.info("Opening landing page")
-    await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
+    # --- Step 1: go directly to /guest (skips the landing page entirely) ---
+    guest_url = "https://www.digitalray.ai/guest"
+    logger.info(f"Navigating directly to {guest_url}")
+    await page.goto(guest_url, wait_until="networkidle", timeout=30000)
 
-    # --- Step 1b: wait for /guest page, click user avatar, then click Log In ---
-    logger.info("Waiting to arrive at /guest page")
-    try:
-        await page.wait_for_url("**/guest**", timeout=15000)
-    except PlaywrightTimeout:
-        raise RuntimeError(
-            f"Button click didn't lead to /guest. Current URL: {page.url}"
-        )
+    # Give the SPA time to finish rendering
+    await page.wait_for_timeout(3000)
 
-    # Let /guest finish rendering
-    await page.wait_for_timeout(2000)
-
-    # Click the user avatar icon (top-right) to open the user menu dropdown.
-    # The avatar has a generic person icon and is the only element in that
-    # position. We target it via its likely parent structures.
+    # --- Step 2a: open the user menu (try clicking the avatar) ---
     logger.info("Opening user menu (top-right avatar)")
     avatar_locators = [
         page.get_by_role("button", name="user"),
@@ -100,7 +93,6 @@ async def _log_in(page) -> None:
         page.locator('[class*="avatar"]').first,
         page.locator('[class*="user-icon"]').first,
         page.locator('[class*="profile"]').first,
-        # Fallback: the avatar is usually an img or svg at the top-right corner
         page.locator('header img, header svg, [class*="header"] img, [class*="header"] svg').last,
     ]
 
@@ -115,14 +107,11 @@ async def _log_in(page) -> None:
             continue
 
     if not avatar_clicked:
-        # If the avatar can't be found, try the sidebar "Log In" as fallback
-        logger.warning("Couldn't click avatar, trying sidebar 'Log In' as fallback")
+        logger.warning("Couldn't click avatar; will try sidebar 'Log In' directly")
 
-    # After clicking avatar, the dropdown should appear. Give it a moment.
     await page.wait_for_timeout(1000)
 
-    # Now click "Log In" - this should now be visible either from the
-    # opened dropdown OR from the sidebar (whichever renders)
+    # --- Step 2b: click "Log In" (from dropdown if opened, or from sidebar) ---
     logger.info("Clicking 'Log In'")
     login_locators = [
         page.get_by_role("link", name="Log In"),
@@ -143,18 +132,17 @@ async def _log_in(page) -> None:
             continue
 
     if not clicked:
-        # Diagnostic dump
         try:
             body_text = await page.locator("body").inner_text()
             logger.error(f"/guest page body text (first 2000 chars): {body_text[:2000]}")
         except Exception:
             pass
         raise RuntimeError(
-            f"Couldn't find 'Log In' on /guest page (tried avatar dropdown and sidebar). "
-            f"Current URL: {page.url}. See prior log line for visible page text."
+            f"Couldn't find 'Log In' on /guest page. Current URL: {page.url}. "
+            f"See prior log line for visible page text."
         )
 
-    # --- Step 2: wait for principlesyou.com Welcome Back page ---
+    # --- Step 3: wait for principlesyou.com Welcome Back page ---
     logger.info("Waiting for principlesyou.com Welcome Back page")
     try:
         await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
@@ -164,28 +152,23 @@ async def _log_in(page) -> None:
             f"Never reached principlesyou.com email form. Current URL: {page.url}"
         )
 
-    # --- Step 3: tick the Terms of Service checkbox (REQUIRED) ---
-    # The checkbox is mandatory - without it the CONTINUE button won't work
-    # and you get a red error: "You must accept the Terms of Service..."
+    # --- Step 4: tick Terms of Service checkbox (mandatory) ---
     logger.info("Ticking Terms of Service checkbox")
     try:
-        # Checkboxes on principlesyou.com are input[type=checkbox]. There
-        # might be multiple on the page, so we target the one near the
-        # Terms of Service text.
         checkbox = page.locator('input[type="checkbox"]').first
         if not await checkbox.is_checked():
             await checkbox.check(timeout=5000)
     except Exception as e:
         logger.warning(f"Couldn't tick Terms checkbox (may not be required): {e}")
 
-    # --- Step 4: fill email and click CONTINUE ---
+    # --- Step 5: fill email and click CONTINUE ---
     logger.info("Filling email address")
     await page.fill(EMAIL_INPUT, settings.digitalray_email)
 
     logger.info("Clicking CONTINUE on email page")
     await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
 
-    # --- Step 5: wait for Enter Your Password page ---
+    # --- Step 6: wait for Enter Your Password page ---
     logger.info("Waiting for password page")
     try:
         await page.wait_for_selector(PASSWORD_INPUT, timeout=20000, state="visible")
@@ -196,16 +179,15 @@ async def _log_in(page) -> None:
             f"Terms checkbox wasn't ticked, or CONTINUE button selector is wrong."
         )
 
-    # --- Step 6: fill password and click CONTINUE ---
+    # --- Step 7: fill password and click CONTINUE ---
     logger.info("Filling password")
     await page.fill(PASSWORD_INPUT, settings.digitalray_password)
 
     logger.info("Clicking CONTINUE on password page")
     await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
 
-    # --- Step 7: wait for redirect back to authenticated digitalray.ai ---
-    # We specifically want /home (not /login, not /guest). Hitting /guest
-    # means authentication silently failed and we fell through to guest mode.
+    # --- Step 8: wait for redirect to authenticated digitalray.ai ---
+    # We want /home (not /login, not /guest). /guest means auth silently failed.
     logger.info("Waiting for redirect to authenticated digitalray.ai")
     try:
         await page.wait_for_url(

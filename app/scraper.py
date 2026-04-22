@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 # On https://principlesyou.com/session_types login page
 EMAIL_INPUT = 'input[type="email"]'
 PASSWORD_INPUT = 'input[type="password"]'
-# The "CONTINUE" button on both the email and password pages of principlesyou.com.
-# Matches by visible text (case-insensitive) to be resilient.
-LOGIN_SUBMIT_BUTTON = 'button:has-text("Continue"), button:has-text("CONTINUE")'
+# The "CONTINUE" button on principlesyou.com email and password pages.
+# We target it multiple ways because it may be a <button>, <input type=submit>,
+# or a styled element with the text "CONTINUE" (case-insensitive).
+# Helper _click_continue() in _log_in() handles the actual clicking.
+LOGIN_SUBMIT_BUTTON = 'CONTINUE_BUTTON_SEE_HELPER'  # sentinel - see _click_continue
 
 # On https://www.digitalray.ai (once logged in)
 CHAT_INPUT = 'textarea'
@@ -166,7 +168,7 @@ async def _log_in(page) -> None:
     await page.fill(EMAIL_INPUT, settings.digitalray_email)
 
     logger.info("Clicking CONTINUE on email page")
-    await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
+    await _click_continue(page)
 
     # --- Step 6: wait for Enter Your Password page ---
     logger.info("Waiting for password page")
@@ -184,7 +186,7 @@ async def _log_in(page) -> None:
     await page.fill(PASSWORD_INPUT, settings.digitalray_password)
 
     logger.info("Clicking CONTINUE on password page")
-    await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
+    await _click_continue(page)
 
     # --- Step 8: wait for redirect to authenticated digitalray.ai ---
     # We want /home (not /login, not /guest). /guest means auth silently failed.
@@ -260,4 +262,49 @@ async def _wait_for_reply_to_stabilize(page, max_wait_seconds: int = 90) -> str:
             last_text = current_text
 
     return last_text
+
+
+async def _click_continue(page) -> None:
+    """
+    Clicks the 'CONTINUE' button on principlesyou.com login pages.
+
+    The button may be a <button>, an <input type=submit>, or a styled
+    element. We try several strategies in order.
+    """
+    # Give the form a moment to enable the button after filling the last field
+    await page.wait_for_timeout(500)
+
+    # Strategies from most-specific to most-permissive
+    strategies = [
+        page.get_by_role("button", name="Continue", exact=False),
+        page.locator('button:has-text("CONTINUE")'),
+        page.locator('button:has-text("Continue")'),
+        page.locator('input[type="submit"]'),
+        page.locator('[type="submit"]'),
+        page.get_by_text("CONTINUE", exact=True),
+        page.get_by_text("Continue", exact=True),
+        page.locator('a:has-text("CONTINUE"), a:has-text("Continue")'),
+    ]
+
+    last_error = None
+    for i, locator in enumerate(strategies):
+        try:
+            await locator.first.click(timeout=5000)
+            logger.info(f"Clicked CONTINUE using strategy #{i + 1}")
+            return
+        except Exception as e:
+            last_error = e
+            continue
+
+    # All strategies failed - dump body text for diagnostics
+    try:
+        body_text = await page.locator("body").inner_text()
+        logger.error(f"principlesyou.com page body text (first 2000 chars): {body_text[:2000]}")
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"Couldn't click CONTINUE button on principlesyou.com. "
+        f"Current URL: {page.url}. Last error: {last_error}. "
+        f"See prior log line for visible page text."
+    )
     

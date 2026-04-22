@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 # On https://principlesyou.com/session_types login page
 EMAIL_INPUT = 'input[type="email"]'
 PASSWORD_INPUT = 'input[type="password"]'
-LOGIN_SUBMIT_BUTTON = 'button[type="submit"]'
+# The "CONTINUE" button on both the email and password pages of principlesyou.com.
+# Matches by visible text (case-insensitive) to be resilient.
+LOGIN_SUBMIT_BUTTON = 'button:has-text("Continue"), button:has-text("CONTINUE")'
 
 # On https://www.digitalray.ai (once logged in)
 CHAT_INPUT = 'textarea'
@@ -64,88 +66,81 @@ async def ask_digitalray(message: str) -> str:
 
 async def _log_in(page) -> None:
     """
-    Performs authenticated login via principlesyou.com OAuth.
+    Performs the full authenticated login flow.
 
-    Flow:
-      1. Open digitalray.ai/login (landing page)
-      2. Click the 'Log In' link in the sidebar (NOT the big red 'Chat with
-         Digital Ray' button - that leads to guest mode)
-      3. Follow OAuth redirect to principlesyou.com/session_types
-      4. If there's a 'Continue with email' button, click it
-      5. Fill email + password, submit
-      6. Wait for redirect back to digitalray.ai (authenticated)
+    Pages visited:
+      1. digitalray.ai/login  (click "Log In" link, NOT "Chat with Digital Ray")
+      2. principlesyou.com Welcome Back page (tick Terms checkbox, fill email, CONTINUE)
+      3. principlesyou.com Enter Password page (fill password, CONTINUE)
+      4. digitalray.ai/home  (authenticated, ready to chat)
     """
     logger.info("Opening landing page")
     await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
 
-    # The landing page has TWO login entry points:
-    #  - Big red 'Chat with Digital Ray' button -> GUEST mode (don't click)
-    #  - 'Log In' link in sidebar -> Authenticated OAuth flow (click this!)
-    logger.info("Looking for 'Log In' link (authenticated path)")
+    # --- Step 1: click "Log In" on digitalray.ai landing page ---
+    logger.info("Clicking 'Log In' link on landing page")
     try:
-        # Match any element whose visible text is exactly "Log In" or "Login"
-        # Using Playwright's text selector, case-insensitive
         await page.get_by_text("Log In", exact=True).first.click(timeout=15000)
-        logger.info("Clicked 'Log In' link, waiting for OAuth redirect")
     except PlaywrightTimeout:
         raise RuntimeError(
             f"Couldn't find 'Log In' link on digitalray.ai landing page. "
             f"Current URL: {page.url}"
         )
 
-    # Wait for the redirect chain to land on principlesyou.com
-    logger.info("Waiting to reach principlesyou.com")
+    # --- Step 2: wait for principlesyou.com Welcome Back page ---
+    logger.info("Waiting for principlesyou.com Welcome Back page")
     try:
         await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
+        await page.wait_for_selector(EMAIL_INPUT, timeout=20000, state="visible")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Clicked Log In but never reached principlesyou.com. "
-            f"Current URL: {page.url}"
+            f"Never reached principlesyou.com email form. Current URL: {page.url}"
         )
 
-    # principlesyou.com/session_types may show login method picker first.
-    # If the email field isn't immediately visible, try clicking a
-    # "Continue with email" option.
-    logger.info("Waiting for email field on principlesyou.com")
-    email_visible = False
+    # --- Step 3: tick the Terms of Service checkbox (REQUIRED) ---
+    # The checkbox is mandatory - without it the CONTINUE button won't work
+    # and you get a red error: "You must accept the Terms of Service..."
+    logger.info("Ticking Terms of Service checkbox")
     try:
-        await page.wait_for_selector(EMAIL_INPUT, timeout=5000, state="visible")
-        email_visible = True
+        # Checkboxes on principlesyou.com are input[type=checkbox]. There
+        # might be multiple on the page, so we target the one near the
+        # Terms of Service text.
+        checkbox = page.locator('input[type="checkbox"]').first
+        if not await checkbox.is_checked():
+            await checkbox.check(timeout=5000)
+    except Exception as e:
+        logger.warning(f"Couldn't tick Terms checkbox (may not be required): {e}")
+
+    # --- Step 4: fill email and click CONTINUE ---
+    logger.info("Filling email address")
+    await page.fill(EMAIL_INPUT, settings.digitalray_email)
+
+    logger.info("Clicking CONTINUE on email page")
+    await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
+
+    # --- Step 5: wait for Enter Your Password page ---
+    logger.info("Waiting for password page")
+    try:
+        await page.wait_for_selector(PASSWORD_INPUT, timeout=20000, state="visible")
     except PlaywrightTimeout:
-        logger.info("Email field not visible yet, trying 'Continue with email' button")
-        # Try common labels for an email-login option
-        for label in ["Continue with email", "Sign in with email",
-                      "Log in with email", "Email"]:
-            try:
-                await page.get_by_text(label, exact=False).first.click(timeout=3000)
-                logger.info(f"Clicked '{label}'")
-                break
-            except PlaywrightTimeout:
-                continue
-
-        # Now wait for the email field to appear
-        try:
-            await page.wait_for_selector(EMAIL_INPUT, timeout=15000, state="visible")
-            email_visible = True
-        except PlaywrightTimeout:
-            pass
-
-    if not email_visible:
         raise RuntimeError(
-            f"Email field never appeared on principlesyou.com. "
-            f"Current URL: {page.url}. The session_types page may have changed."
+            f"Password page never appeared after clicking CONTINUE. "
+            f"Current URL: {page.url}. Possible causes: wrong email, "
+            f"Terms checkbox wasn't ticked, or CONTINUE button selector is wrong."
         )
 
-    logger.info("Filling in credentials")
-    await page.fill(EMAIL_INPUT, settings.digitalray_email)
+    # --- Step 6: fill password and click CONTINUE ---
+    logger.info("Filling password")
     await page.fill(PASSWORD_INPUT, settings.digitalray_password)
 
-    logger.info("Submitting login form")
-    await page.click(LOGIN_SUBMIT_BUTTON)
+    logger.info("Clicking CONTINUE on password page")
+    await page.click(LOGIN_SUBMIT_BUTTON, timeout=10000)
 
-    logger.info("Waiting for redirect back to digitalray.ai")
+    # --- Step 7: wait for redirect back to authenticated digitalray.ai ---
+    # We specifically want /home (not /login, not /guest). Hitting /guest
+    # means authentication silently failed and we fell through to guest mode.
+    logger.info("Waiting for redirect to authenticated digitalray.ai")
     try:
-        # Wait for URL to contain digitalray.ai AND NOT be /guest or /login
         await page.wait_for_url(
             lambda url: "digitalray.ai" in url
                         and "/guest" not in url
@@ -155,9 +150,9 @@ async def _log_in(page) -> None:
         await page.wait_for_load_state("networkidle", timeout=30000)
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Login submit didn't redirect back to authenticated digitalray.ai. "
-            f"Current URL: {page.url}. Possible causes: wrong credentials, 2FA, "
-            f"or email verification required."
+            f"Login submit didn't redirect to authenticated digitalray.ai. "
+            f"Current URL: {page.url}. Possible causes: wrong password, "
+            f"2FA required, or email verification needed."
         )
 
     logger.info(f"Login successful. Current URL: {page.url}")

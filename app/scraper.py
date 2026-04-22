@@ -94,7 +94,7 @@ async def _log_in(page) -> None:
         )
 
     logger.info("Login successful")
-    async def _send_message_and_get_reply(page, message: str) -> str:
+async def _send_message_and_get_reply(page, message: str) -> str:
     """Types the message, clicks send, waits for the streamed reply to complete."""
     logger.info("Waiting for chat interface")
     await page.wait_for_selector(CHAT_INPUT, timeout=20000)

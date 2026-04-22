@@ -63,34 +63,77 @@ async def ask_digitalray(message: str) -> str:
 
 
 async def _log_in(page) -> None:
-    """Performs the full login flow via principlesyou.com OAuth."""
+    """
+    Performs authenticated login via principlesyou.com OAuth.
+
+    Flow:
+      1. Open digitalray.ai/login (landing page)
+      2. Click the 'Log In' link in the sidebar (NOT the big red 'Chat with
+         Digital Ray' button - that leads to guest mode)
+      3. Follow OAuth redirect to principlesyou.com/session_types
+      4. If there's a 'Continue with email' button, click it
+      5. Fill email + password, submit
+      6. Wait for redirect back to digitalray.ai (authenticated)
+    """
     logger.info("Opening landing page")
     await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
 
-    # digitalray.ai/login shows a landing page with a "Chat with Digital Ray"
-    # button. Clicking it triggers the OAuth redirect to principlesyou.com.
-    logger.info("Looking for 'Chat with Digital Ray' button")
+    # The landing page has TWO login entry points:
+    #  - Big red 'Chat with Digital Ray' button -> GUEST mode (don't click)
+    #  - 'Log In' link in sidebar -> Authenticated OAuth flow (click this!)
+    logger.info("Looking for 'Log In' link (authenticated path)")
     try:
-        await page.click(
-            'button:has-text("Chat with Digital Ray"), a:has-text("Chat with Digital Ray")',
-            timeout=15000,
-        )
-        logger.info("Clicked the Chat button, waiting for OAuth redirect")
+        # Match any element whose visible text is exactly "Log In" or "Login"
+        # Using Playwright's text selector, case-insensitive
+        await page.get_by_text("Log In", exact=True).first.click(timeout=15000)
+        logger.info("Clicked 'Log In' link, waiting for OAuth redirect")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Couldn't find the 'Chat with Digital Ray' button on the landing page. "
+            f"Couldn't find 'Log In' link on digitalray.ai landing page. "
             f"Current URL: {page.url}"
         )
 
-    # Wait for redirect to principlesyou.com
-    logger.info("Waiting for principlesyou.com login form")
+    # Wait for the redirect chain to land on principlesyou.com
+    logger.info("Waiting to reach principlesyou.com")
     try:
         await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
-        await page.wait_for_selector(EMAIL_INPUT, timeout=20000)
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Never reached the principlesyou.com login form. "
+            f"Clicked Log In but never reached principlesyou.com. "
             f"Current URL: {page.url}"
+        )
+
+    # principlesyou.com/session_types may show login method picker first.
+    # If the email field isn't immediately visible, try clicking a
+    # "Continue with email" option.
+    logger.info("Waiting for email field on principlesyou.com")
+    email_visible = False
+    try:
+        await page.wait_for_selector(EMAIL_INPUT, timeout=5000, state="visible")
+        email_visible = True
+    except PlaywrightTimeout:
+        logger.info("Email field not visible yet, trying 'Continue with email' button")
+        # Try common labels for an email-login option
+        for label in ["Continue with email", "Sign in with email",
+                      "Log in with email", "Email"]:
+            try:
+                await page.get_by_text(label, exact=False).first.click(timeout=3000)
+                logger.info(f"Clicked '{label}'")
+                break
+            except PlaywrightTimeout:
+                continue
+
+        # Now wait for the email field to appear
+        try:
+            await page.wait_for_selector(EMAIL_INPUT, timeout=15000, state="visible")
+            email_visible = True
+        except PlaywrightTimeout:
+            pass
+
+    if not email_visible:
+        raise RuntimeError(
+            f"Email field never appeared on principlesyou.com. "
+            f"Current URL: {page.url}. The session_types page may have changed."
         )
 
     logger.info("Filling in credentials")
@@ -102,15 +145,22 @@ async def _log_in(page) -> None:
 
     logger.info("Waiting for redirect back to digitalray.ai")
     try:
-        await page.wait_for_url("**/digitalray.ai/**", timeout=30000)
+        # Wait for URL to contain digitalray.ai AND NOT be /guest or /login
+        await page.wait_for_url(
+            lambda url: "digitalray.ai" in url
+                        and "/guest" not in url
+                        and "/login" not in url,
+            timeout=30000,
+        )
         await page.wait_for_load_state("networkidle", timeout=30000)
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Login submit succeeded but we never got back to digitalray.ai. "
-            f"Current URL: {page.url}. Possible causes: wrong credentials or 2FA."
+            f"Login submit didn't redirect back to authenticated digitalray.ai. "
+            f"Current URL: {page.url}. Possible causes: wrong credentials, 2FA, "
+            f"or email verification required."
         )
 
-    logger.info("Login successful")
+    logger.info(f"Login successful. Current URL: {page.url}")
 
 
 async def _send_message_and_get_reply(page, message: str) -> str:

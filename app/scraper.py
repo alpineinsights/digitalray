@@ -154,6 +154,9 @@ async def _log_in(page) -> None:
             f"Never reached principlesyou.com email form. Current URL: {page.url}"
         )
 
+    # The OneTrust cookie banner may be covering buttons - dismiss it
+    await _dismiss_cookie_banner(page)
+
     # --- Step 4: tick Terms of Service checkbox (mandatory) ---
     logger.info("Ticking Terms of Service checkbox")
     try:
@@ -173,76 +176,90 @@ async def _log_in(page) -> None:
     logger.info("Clicking CONTINUE on email page")
     await _click_continue(page)
 
-    # --- Step 6: wait for navigation AND password field ---
-    logger.info("Waiting for password page to load")
+    # --- Step 6: wait for password page ---
+    # On principlesyou.com, the email and password forms share the same URL,
+    # so we can't wait for URL change. Instead, wait for the password field
+    # to become visible (it's not present on the email form).
+    logger.info("Waiting for password page to appear")
     try:
-        # Wait for URL to change (meaning navigation actually happened)
-        await page.wait_for_function(
-            f"() => window.location.href !== {url_before_email_submit!r}",
-            timeout=15000,
-        )
-        # Then wait for network to settle on the new page
-        await page.wait_for_load_state("networkidle", timeout=15000)
-        # Then wait for the password input to be visible
         await page.wait_for_selector(PASSWORD_INPUT, timeout=15000, state="visible")
         logger.info(f"Password page loaded. Current URL: {page.url}")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Password page never appeared after clicking CONTINUE. "
-            f"Current URL: {page.url}. Possible causes: wrong email, "
-            f"Terms checkbox not ticked, or CONTINUE didn't actually submit."
+            f"Password page never appeared after email CONTINUE. "
+            f"Current URL: {page.url}."
         )
 
-    # --- Step 7: fill password and click CONTINUE ---
+    # --- Step 7: fill password and submit ---
     logger.info("Filling password")
     await page.fill(PASSWORD_INPUT, settings.digitalray_password)
 
-    # Capture URL before password submit
-    url_before_password_submit = page.url
-
-    logger.info("Clicking CONTINUE on password page")
-    await _click_continue(page)
-
-    # --- Step 8: wait for navigation away from principlesyou.com ---
-    logger.info("Waiting for redirect away from principlesyou.com")
+    # Try submitting three different ways: press Enter, click CONTINUE, submit form.
+    # Whichever triggers navigation first wins.
+    logger.info("Submitting password - trying Enter key first")
     try:
-        await page.wait_for_function(
-            f"() => window.location.href !== {url_before_password_submit!r}",
-            timeout=15000,
+        # Pressing Enter on the password field submits most HTML forms natively
+        await page.press(PASSWORD_INPUT, "Enter")
+    except Exception as e:
+        logger.warning(f"Enter press failed: {e}")
+
+    # Give it a moment to start navigating
+    await page.wait_for_timeout(2000)
+
+    # If we're still on principlesyou.com and password field still visible,
+    # the Enter didn't work - try clicking CONTINUE
+    if "principlesyou.com" in page.url:
+        try:
+            still_on_password = await page.locator(PASSWORD_INPUT).is_visible(timeout=1000)
+        except Exception:
+            still_on_password = False
+        if still_on_password:
+            logger.info("Enter didn't submit - trying CONTINUE click")
+            try:
+                await _click_continue(page)
+            except Exception as e:
+                logger.warning(f"CONTINUE click failed too: {e}")
+
+            # If still stuck, try direct form submission via JS
+            await page.wait_for_timeout(2000)
+            try:
+                still_on_password = await page.locator(PASSWORD_INPUT).is_visible(timeout=1000)
+            except Exception:
+                still_on_password = False
+            if still_on_password:
+                logger.info("Click didn't submit either - trying form.submit() via JS")
+                try:
+                    await page.evaluate("""
+                        () => {
+                            const pwd = document.querySelector('input[type="password"]');
+                            if (pwd && pwd.form) pwd.form.submit();
+                        }
+                    """)
+                except Exception as e:
+                    logger.warning(f"JS form.submit() failed: {e}")
+
+    # --- Step 8: wait for redirect to authenticated digitalray.ai ---
+    logger.info("Waiting for redirect to authenticated digitalray.ai")
+    try:
+        await page.wait_for_url(
+            lambda url: "digitalray.ai" in url
+                        and "/guest" not in url
+                        and "/login" not in url,
+            timeout=30000,
         )
-        await page.wait_for_load_state("networkidle", timeout=15000)
-        logger.info(f"Navigation happened. Current URL: {page.url}")
+        await page.wait_for_load_state("networkidle", timeout=30000)
     except PlaywrightTimeout:
-        # Dump body text to see any error message on the password page
+        # Diagnostic dump
         try:
             body_text = await page.locator("body").inner_text()
-            logger.error(f"Password page body text: {body_text[:2000]}")
+            logger.error(f"Post-password page body: {body_text[:2000]}")
         except Exception:
             pass
         raise RuntimeError(
-            f"Password CONTINUE didn't trigger any navigation. "
-            f"Current URL: {page.url}. Possible causes: wrong password, "
-            f"CONTINUE button didn't actually submit, or validation error."
+            f"Password submit didn't redirect to authenticated digitalray.ai. "
+            f"Current URL: {page.url}. Possible causes: wrong password, 2FA "
+            f"required, email verification needed, or cookie banner blocking submit."
         )
-
-    # --- Step 9: confirm we're on authenticated digitalray.ai ---
-    if "digitalray.ai" not in page.url or "/guest" in page.url or "/login" in page.url:
-        # We navigated, but not to where we wanted. Wait a bit more in case
-        # there's a chain of redirects still in progress.
-        try:
-            await page.wait_for_url(
-                lambda url: "digitalray.ai" in url
-                            and "/guest" not in url
-                            and "/login" not in url,
-                timeout=20000,
-            )
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except PlaywrightTimeout:
-            raise RuntimeError(
-                f"Navigated, but not to authenticated digitalray.ai. "
-                f"Current URL: {page.url}. Possible cause: authentication "
-                f"silently failed and we fell to guest mode or an error page."
-            )
 
     logger.info(f"Login successful. Current URL: {page.url}")
 
@@ -345,4 +362,30 @@ async def _click_continue(page) -> None:
         f"Current URL: {page.url}. Last error: {last_error}. "
         f"See prior log line for visible page text."
     )
+
+
+async def _dismiss_cookie_banner(page) -> None:
+    """
+    Dismisses the OneTrust cookie consent banner if visible.
+    Safe to call even if no banner exists.
+    """
+    banner_buttons = [
+        page.get_by_role("button", name="Reject All"),
+        page.get_by_role("button", name="Accept All"),
+        page.get_by_role("button", name="Ok"),
+        page.locator('#onetrust-reject-all-handler'),
+        page.locator('#onetrust-accept-btn-handler'),
+        page.locator('button:has-text("Reject All")'),
+        page.locator('button:has-text("Ok")'),
+    ]
+    for locator in banner_buttons:
+        try:
+            await locator.first.click(timeout=2000)
+            logger.info("Dismissed cookie banner")
+            await page.wait_for_timeout(500)
+            return
+        except Exception:
+            continue
+    # No banner found - that's fine
+    logger.info("No cookie banner to dismiss")
     

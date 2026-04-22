@@ -64,15 +64,32 @@ async def ask_digitalray(message: str) -> str:
 
 async def _log_in(page) -> None:
     """Performs the full login flow via principlesyou.com OAuth."""
-    logger.info("Opening login page")
+    logger.info("Opening landing page")
     await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
 
-    logger.info("Waiting for login form")
+    # digitalray.ai/login shows a landing page with a "Chat with Digital Ray"
+    # button. Clicking it triggers the OAuth redirect to principlesyou.com.
+    logger.info("Looking for 'Chat with Digital Ray' button")
     try:
+        await page.click(
+            'button:has-text("Chat with Digital Ray"), a:has-text("Chat with Digital Ray")',
+            timeout=15000,
+        )
+        logger.info("Clicked the Chat button, waiting for OAuth redirect")
+    except PlaywrightTimeout:
+        raise RuntimeError(
+            f"Couldn't find the 'Chat with Digital Ray' button on the landing page. "
+            f"Current URL: {page.url}"
+        )
+
+    # Wait for redirect to principlesyou.com
+    logger.info("Waiting for principlesyou.com login form")
+    try:
+        await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
         await page.wait_for_selector(EMAIL_INPUT, timeout=20000)
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Login form never appeared. Selector '{EMAIL_INPUT}' may be wrong. "
+            f"Never reached the principlesyou.com login form. "
             f"Current URL: {page.url}"
         )
 
@@ -94,6 +111,8 @@ async def _log_in(page) -> None:
         )
 
     logger.info("Login successful")
+
+
 async def _send_message_and_get_reply(page, message: str) -> str:
     """Types the message, clicks send, waits for the streamed reply to complete."""
     logger.info("Waiting for chat interface")

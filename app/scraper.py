@@ -256,11 +256,12 @@ async def _extract_latest_reply(page, user_message: str) -> str:
     # Split into non-empty lines
     all_lines = [line.strip() for line in full_text.split("\n") if line.strip()]
 
-    # --- Strategy 1: Use the disclaimer line as the END marker ---
-    # The disclaimer appears right after the analysis and is very distinctive.
+    # --- Find the END boundary via disclaimer markers ---
     end_markers = [
         "This response includes information from external sources",
         "may contain inaccuracies",
+        "DigitalRay may produce",
+        "Feel free to ask",
     ]
     end_idx = None
     for i, line in enumerate(all_lines):
@@ -268,96 +269,79 @@ async def _extract_latest_reply(page, user_message: str) -> str:
             end_idx = i
             break
 
-    # --- Strategy 2: Find the START of the analysis ---
-    # The analysis starts AFTER the sources list. Sources are lines that
-    # look like URLs or site domains. We walk forward past them.
-    #
-    # We also skip the echoed user question and any UI text before it.
-    start_idx = None
-
-    # First, locate the echoed question line
+    # --- Find the echoed-question line ---
     question_idx = None
     user_msg_lower = user_message.lower().strip()
     for i, line in enumerate(all_lines):
-        # Match when the line IS the question (not when it merely contains it)
-        # and is short enough to be the echo (not the analysis itself)
         line_lower = line.lower().strip()
         if user_msg_lower in line_lower and len(line) < len(user_message) + 30:
             question_idx = i
             break
 
-    if question_idx is not None:
-        # After the question comes the source list. Walk forward until we
-        # find the first line that looks like PROSE (not a URL, not a title
-        # of a source article with a domain immediately after it).
-        for i in range(question_idx + 1, end_idx or len(all_lines)):
-            line = all_lines[i]
-            # Skip lines that look like URLs (domain names)
-            if _looks_like_url_or_domain(line):
-                continue
-            # Skip short lines that look like source article titles
-            # (titles are usually followed by a domain line on the next line)
-            if i + 1 < len(all_lines) and _looks_like_url_or_domain(all_lines[i + 1]):
-                continue
-            # Found the first prose line - this is where the analysis starts
-            start_idx = i
-            break
+    # --- Collect candidate analysis lines between question and disclaimer ---
+    # A line is part of the analysis if:
+    #   - It's NOT a URL/domain
+    #   - It's NOT a source title (heuristic: ends in "..." or "..." in middle,
+    #     or contains " - " pattern like "Title - Publication")
+    #   - It's NOT a short UI string (nav, button, etc.)
+    start_scan = (question_idx + 1) if question_idx is not None else 0
+    end_scan = end_idx if end_idx is not None else len(all_lines)
 
-    # --- If both markers found, extract cleanly ---
-    if start_idx is not None and end_idx is not None and end_idx > start_idx:
-        analysis_lines = all_lines[start_idx:end_idx]
-        cleaned = "\n".join(analysis_lines).strip()
-        if len(cleaned) > 100:  # sanity check
-            logger.info(f"Extracted analysis via markers: {len(cleaned)} chars")
-            return cleaned
-
-    # --- Fallback: return the longest paragraph-like block ---
-    # This handles cases where markers shifted or are missing.
-    logger.warning("Marker-based extraction failed - using longest-block fallback")
-
-    # Exclude lines that are obviously UI chrome
     ui_chrome_patterns = (
         "Hello,", "How can I help", "Voice Chat with",
-        "DigitalRay may produce", "Feel free to ask",
-        "This response includes", "Type Your Questions",
+        "Type Your Questions",
         "New Chat", "Chat History", "My Principles",
+        "Principle of the Day", "Register Now", "Log In",
     )
-    candidate_lines = []
-    for line in all_lines:
+
+    analysis_lines = []
+    for i in range(start_scan, end_scan):
+        line = all_lines[i]
+
+        # Skip UI chrome
         if any(pat in line for pat in ui_chrome_patterns):
             continue
+        # Skip URL-like lines
         if _looks_like_url_or_domain(line):
             continue
+        # Skip source titles - heuristics:
+        # 1. Line ends with "..." (truncated title)
+        # 2. Line contains " - " AND is short (< 100 chars) - article title pattern
+        # 3. Line is followed by a URL/domain line (original heuristic)
+        if line.endswith("...") or line.endswith("…"):
+            continue
+        if " - " in line and len(line) < 100 and i + 1 < len(all_lines):
+            # Check if next line looks source-listy (short, no full sentence)
+            next_line = all_lines[i + 1] if i + 1 < len(all_lines) else ""
+            if _looks_like_url_or_domain(next_line) or (len(next_line) < 60 and " - " in next_line):
+                continue
+        if i + 1 < end_scan and _looks_like_url_or_domain(all_lines[i + 1]):
+            continue
+        # Skip the echoed question variant (partial match)
         if user_msg_lower in line.lower() and len(line) < len(user_message) + 30:
-            continue  # echoed question
-        candidate_lines.append(line)
+            continue
 
-    # Join consecutive non-short lines (the analysis is a contiguous block)
-    # and return the longest such block
-    blocks = []
-    current_block = []
-    for line in candidate_lines:
-        if len(line) > 50:  # analysis paragraphs are long
-            current_block.append(line)
-        else:
-            if current_block:
-                blocks.append("\n".join(current_block))
-                current_block = []
-    if current_block:
-        blocks.append("\n".join(current_block))
+        analysis_lines.append(line)
 
-    if blocks:
-        longest = max(blocks, key=len)
-        logger.info(f"Extracted analysis via fallback (longest block): {len(longest)} chars")
-        return longest
+    # --- Join all analysis lines into one block ---
+    # We deliberately do NOT split on short lines here - that was the bug.
+    # The analysis can have short sentences or line-break artifacts in it.
+    cleaned = "\n".join(analysis_lines).strip()
 
-    # Last resort: return everything after the question, before the disclaimer
-    if question_idx is not None and end_idx is not None:
+    # Sanity check: analysis should be at least ~200 chars
+    if len(cleaned) >= 200:
+        logger.info(f"Extracted analysis: {len(cleaned)} chars (end_marker_found={end_idx is not None})")
+        return cleaned
+
+    # --- Last resort: return everything between question and disclaimer ---
+    if question_idx is not None and end_idx is not None and end_idx > question_idx + 1:
         raw = "\n".join(all_lines[question_idx + 1 : end_idx]).strip()
         logger.warning(f"Using last-resort extraction: {len(raw)} chars")
         return raw
 
-    return ""
+    # If we still have nothing usable, return whatever we got
+    logger.warning(f"Extraction produced only {len(cleaned)} chars")
+    return cleaned
 
 
 def _looks_like_url_or_domain(line: str) -> bool:

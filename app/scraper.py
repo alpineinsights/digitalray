@@ -74,45 +74,87 @@ async def ask_digitalray(message: str) -> str:
 async def _log_in(page) -> None:
     """
     Performs authenticated login via principlesyou.com OAuth.
-    Mirrors the working Axiom automation step-for-step.
+
+    Flow:
+      1. Navigate directly to digitalray.ai/guest
+      2. Click user avatar (top-right) to open menu dropdown
+      3. Click "Log In" from the dropdown
+      4. On principlesyou.com email form: fill email, click Continue,
+         tick Terms, click Continue again
+      5. On password page: type password with keystroke delay, click Continue
+      6. Redirect to digitalray.ai/home
     """
-    # Step 1: Go to the login landing page
-    logger.info("Opening digitalray.ai/login")
-    await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
+    # --- Step 1: go directly to /guest ---
+    guest_url = "https://www.digitalray.ai/guest"
+    logger.info(f"Navigating to {guest_url}")
+    await page.goto(guest_url, wait_until="networkidle", timeout=30000)
+    await page.wait_for_timeout(3000)
 
-    # Step 2: Wait 5 seconds for SPA rendering (same as Axiom does)
-    logger.info("Waiting 5 seconds for page to settle")
-    await page.wait_for_timeout(5000)
+    # --- Step 2: click the user avatar to open the menu dropdown ---
+    logger.info("Opening user menu (top-right avatar)")
+    avatar_locators = [
+        page.get_by_role("button", name="user"),
+        page.get_by_role("button", name="profile"),
+        page.get_by_role("button", name="menu"),
+        page.locator('[class*="avatar"]').first,
+        page.locator('[class*="user-icon"]').first,
+        page.locator('[class*="profile"]').first,
+        page.locator('header img, header svg, [class*="header"] img, [class*="header"] svg').last,
+    ]
+    for i, locator in enumerate(avatar_locators):
+        try:
+            await locator.click(timeout=3000)
+            logger.info(f"Clicked user avatar using strategy #{i + 1}")
+            break
+        except Exception:
+            continue
+    await page.wait_for_timeout(1000)
 
-    # Step 3: Click "Chat with Digital Ray" button (optional - may redirect
-    # automatically on some sessions). This leads to the principlesyou.com login.
-    logger.info("Clicking 'Chat with Digital Ray' button")
-    try:
-        await page.click(CHAT_WITH_DIGITAL_RAY_BUTTON, timeout=10000)
-    except PlaywrightTimeout:
-        logger.info("'Chat with Digital Ray' button not found, continuing anyway "
-                    "(may have auto-redirected)")
+    # --- Step 3: click "Log In" (from dropdown or sidebar) ---
+    logger.info("Clicking 'Log In'")
+    login_locators = [
+        page.get_by_role("link", name="Log In"),
+        page.get_by_role("button", name="Log In"),
+        page.get_by_text("Log In", exact=True),
+        page.locator("a:has-text('Log In'), button:has-text('Log In'), span:has-text('Log In'), div:has-text('Log In')"),
+        page.locator("text=/^\\s*Log In\\s*$/i"),
+    ]
+    clicked = False
+    for i, locator in enumerate(login_locators):
+        try:
+            await locator.first.click(timeout=5000)
+            logger.info(f"Clicked 'Log In' using strategy #{i + 1}")
+            clicked = True
+            break
+        except Exception:
+            continue
+    if not clicked:
+        try:
+            body_text = await page.locator("body").inner_text()
+            logger.error(f"/guest page body: {body_text[:1500]}")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Couldn't find 'Log In' on /guest page. Current URL: {page.url}"
+        )
 
-    # Step 4: Wait for the principlesyou.com login form to appear
+    # --- Step 4: wait for principlesyou.com email form ---
     logger.info("Waiting for principlesyou.com email form")
     try:
+        await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
         await page.wait_for_selector(EMAIL_INPUT, timeout=20000, state="visible")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Email form never appeared on principlesyou.com. "
-            f"Current URL: {page.url}"
+            f"Email form never appeared on principlesyou.com. Current URL: {page.url}"
         )
 
-    # Step 5: Fill email and click Continue (first time)
+    # --- Step 5: fill email, click Continue, tick Terms, click Continue again ---
     logger.info("Filling email address")
     await page.fill(EMAIL_INPUT, settings.digitalray_email)
 
     logger.info("Clicking Continue (email page, first click)")
     await page.click(EMAIL_CONTINUE_BUTTON, timeout=10000)
 
-    # Step 6: Tick the Terms of Service checkbox
-    # Axiom clicks Continue first, which reveals the Terms requirement.
-    # We give the page a moment to show the checkbox, then tick it.
     await page.wait_for_timeout(1000)
     logger.info("Ticking Terms of Service checkbox")
     try:
@@ -120,11 +162,10 @@ async def _log_in(page) -> None:
     except Exception as e:
         logger.warning(f"Couldn't tick Terms checkbox: {e}")
 
-    # Step 7: Click Continue again to submit the email + terms
-    logger.info("Clicking Continue (email page, second click after ticking Terms)")
+    logger.info("Clicking Continue (email page, second click)")
     await page.click(EMAIL_CONTINUE_BUTTON, timeout=10000)
 
-    # Step 8: Wait for the password page
+    # --- Step 6: wait for password field, type password with delay, Continue ---
     logger.info("Waiting for password field")
     try:
         await page.wait_for_selector(PASSWORD_INPUT, timeout=20000, state="visible")
@@ -133,35 +174,30 @@ async def _log_in(page) -> None:
             f"Password field never appeared. Current URL: {page.url}"
         )
 
-    # Step 9: Type the password with small keystroke delay (as Axiom does).
-    # The 3ms/keystroke delay helps avoid bot detection.
     logger.info("Typing password (with keystroke delay)")
-    await page.click(PASSWORD_INPUT)  # focus the field first
+    await page.click(PASSWORD_INPUT)
     await page.type(PASSWORD_INPUT, settings.digitalray_password, delay=3)
 
-    # Step 10: Click Continue on the password page
     logger.info("Clicking Continue (password page)")
     await page.click(PASSWORD_CONTINUE_BUTTON, timeout=10000)
 
-    # Step 11: Wait for redirect to authenticated digitalray.ai/home
+    # --- Step 7: wait for redirect to digitalray.ai/home ---
     logger.info("Waiting for redirect to digitalray.ai/home")
     try:
         await page.wait_for_url(
-            lambda url: "digitalray.ai" in url
-                        and "/home" in url,
+            lambda url: "digitalray.ai" in url and "/home" in url,
             timeout=30000,
         )
         await page.wait_for_load_state("networkidle", timeout=30000)
     except PlaywrightTimeout:
-        # Diagnostic dump
         try:
             body_text = await page.locator("body").inner_text()
-            logger.error(f"Post-login page body (first 1500 chars): {body_text[:1500]}")
+            logger.error(f"Post-login body: {body_text[:1500]}")
         except Exception:
             pass
         raise RuntimeError(
-            f"Login didn't redirect to digitalray.ai/home. Current URL: {page.url}. "
-            f"Possible causes: wrong credentials, 2FA, or email verification."
+            f"Login didn't redirect to /home. Current URL: {page.url}. "
+            f"Possible causes: wrong credentials, 2FA, verification email needed."
         )
 
     logger.info(f"Login successful. Current URL: {page.url}")

@@ -1,14 +1,18 @@
 """
 Scraper: drives a headless browser to log into digitalray.ai and send a message.
 
-Why Playwright and not pure HTTP?
----------------------------------
-digitalray.ai uses Firebase Auth + OAuth through principlesyou.com. The JWT
-token ends up in an httpOnly cookie (invisible to JavaScript). Replicating
-this entire flow in pure HTTP is fragile. A real browser handles all the
-redirects, cookies, and token exchange automatically - just like a human.
-
-This module has ONE public function: ask_digitalray(message).
+Flow (mirrors the proven Axiom.ai automation):
+    1. Go to digitalray.ai/login
+    2. Wait 5 seconds for the SPA to render
+    3. Click "Chat with Digital Ray" button (leads to principlesyou.com login)
+    4. Fill email -> click Continue (this reveals the Terms checkbox)
+    5. Tick Terms checkbox -> click Continue again
+    6. On password page, fill password (with keystroke delay) -> click Continue
+    7. Redirected to digitalray.ai/home
+    8. Type question in chat textarea
+    9. Click send button
+    10. Wait 35 seconds for the AI reply to complete
+    11. Scrape the reply text
 """
 import asyncio
 import logging
@@ -20,30 +24,31 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# SELECTORS - verify each one on the actual site before running.
-# How to find: right-click element in Chrome -> Inspect -> right-click HTML
-# line -> Copy -> Copy selector. Paste below replacing the guess.
+# SELECTORS - matching the exact selectors used by the working Axiom automation
 # ============================================================================
 
-# On https://principlesyou.com/session_types login page
-EMAIL_INPUT = 'input[type="email"]'
-PASSWORD_INPUT = 'input[type="password"]'
-# The "CONTINUE" button on principlesyou.com email and password pages.
-# We target it multiple ways because it may be a <button>, <input type=submit>,
-# or a styled element with the text "CONTINUE" (case-insensitive).
-# Helper _click_continue() in _log_in() handles the actual clicking.
-LOGIN_SUBMIT_BUTTON = 'CONTINUE_BUTTON_SEE_HELPER'  # sentinel - see _click_continue
+# On https://www.digitalray.ai/login
+CHAT_WITH_DIGITAL_RAY_BUTTON = 'button.el-button.btn:has-text("Chat with Digital Ray")'
 
-# On https://www.digitalray.ai (once logged in)
-CHAT_INPUT = 'textarea'
-SEND_BUTTON = 'button[aria-label*="send" i]'
-LATEST_REPLY_SELECTOR = '.message-ai:last-of-type, [class*="assistant"]:last-of-type'
+# On https://principlesyou.com/session_types (email page)
+EMAIL_INPUT = '#email_address'
+EMAIL_CONTINUE_BUTTON = '#signInEmail'            # <input type="submit">
+TERMS_CHECKBOX = '#accept_terms'                  # <input type="checkbox">
+
+# On https://principlesyou.com/session/password (password page)
+PASSWORD_INPUT = '#password'
+PASSWORD_CONTINUE_BUTTON = 'button[type="submit"]'  # <button type="submit">
+
+# On https://www.digitalray.ai/home
+CHAT_INPUT = '#v-step-8'                          # <textarea>
+SEND_BUTTON = '#v-step-10'                        # <button>
+# Reply is scraped by grabbing all nested divs - we use a broader selector
+REPLY_TEXT_AREA = '[class*="answer"], [class*="message"], [class*="reply"]'
 
 
 async def ask_digitalray(message: str) -> str:
     """
-    Opens a browser, logs into digitalray.ai, sends a message, and returns
-    the AI's reply as a string.
+    Opens a browser, logs into digitalray.ai, sends a message, returns the reply.
     """
     logger.info(f"Processing message: {message[:60]}...")
 
@@ -68,183 +73,82 @@ async def ask_digitalray(message: str) -> str:
 
 async def _log_in(page) -> None:
     """
-    Performs the full authenticated login flow.
-
-    Navigation path:
-      1. Navigate directly to digitalray.ai/guest (contains the Log In link)
-      2. Click "Log In" (via user avatar dropdown OR sidebar - both tried)
-      3. principlesyou.com Welcome Back page: tick Terms checkbox, fill
-         email, click CONTINUE
-      4. principlesyou.com Enter Password page: fill password, click CONTINUE
-      5. Redirect back to digitalray.ai/home (authenticated, ready to chat)
+    Performs authenticated login via principlesyou.com OAuth.
+    Mirrors the working Axiom automation step-for-step.
     """
-    # --- Step 1: go directly to /guest (skips the landing page entirely) ---
-    guest_url = "https://www.digitalray.ai/guest"
-    logger.info(f"Navigating directly to {guest_url}")
-    await page.goto(guest_url, wait_until="networkidle", timeout=30000)
+    # Step 1: Go to the login landing page
+    logger.info("Opening digitalray.ai/login")
+    await page.goto(settings.login_page_url, wait_until="networkidle", timeout=30000)
 
-    # Give the SPA time to finish rendering
-    await page.wait_for_timeout(3000)
+    # Step 2: Wait 5 seconds for SPA rendering (same as Axiom does)
+    logger.info("Waiting 5 seconds for page to settle")
+    await page.wait_for_timeout(5000)
 
-    # --- Step 2a: open the user menu (try clicking the avatar) ---
-    logger.info("Opening user menu (top-right avatar)")
-    avatar_locators = [
-        page.get_by_role("button", name="user"),
-        page.get_by_role("button", name="profile"),
-        page.get_by_role("button", name="menu"),
-        page.locator('[class*="avatar"]').first,
-        page.locator('[class*="user-icon"]').first,
-        page.locator('[class*="profile"]').first,
-        page.locator('header img, header svg, [class*="header"] img, [class*="header"] svg').last,
-    ]
-
-    avatar_clicked = False
-    for i, locator in enumerate(avatar_locators):
-        try:
-            await locator.click(timeout=3000)
-            logger.info(f"Clicked user avatar using strategy #{i + 1}")
-            avatar_clicked = True
-            break
-        except Exception:
-            continue
-
-    if not avatar_clicked:
-        logger.warning("Couldn't click avatar; will try sidebar 'Log In' directly")
-
-    await page.wait_for_timeout(1000)
-
-    # --- Step 2b: click "Log In" (from dropdown if opened, or from sidebar) ---
-    logger.info("Clicking 'Log In'")
-    login_locators = [
-        page.get_by_role("link", name="Log In"),
-        page.get_by_role("button", name="Log In"),
-        page.get_by_text("Log In", exact=True),
-        page.locator("a:has-text('Log In'), button:has-text('Log In'), span:has-text('Log In'), div:has-text('Log In')"),
-        page.locator("text=/^\\s*Log In\\s*$/i"),
-    ]
-
-    clicked = False
-    for i, locator in enumerate(login_locators):
-        try:
-            await locator.first.click(timeout=5000)
-            logger.info(f"Clicked 'Log In' using strategy #{i + 1}")
-            clicked = True
-            break
-        except Exception:
-            continue
-
-    if not clicked:
-        try:
-            body_text = await page.locator("body").inner_text()
-            logger.error(f"/guest page body text (first 2000 chars): {body_text[:2000]}")
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Couldn't find 'Log In' on /guest page. Current URL: {page.url}. "
-            f"See prior log line for visible page text."
-        )
-
-    # --- Step 3: wait for principlesyou.com Welcome Back page ---
-    logger.info("Waiting for principlesyou.com Welcome Back page")
+    # Step 3: Click "Chat with Digital Ray" button (optional - may redirect
+    # automatically on some sessions). This leads to the principlesyou.com login.
+    logger.info("Clicking 'Chat with Digital Ray' button")
     try:
-        await page.wait_for_url("**/principlesyou.com/**", timeout=20000)
+        await page.click(CHAT_WITH_DIGITAL_RAY_BUTTON, timeout=10000)
+    except PlaywrightTimeout:
+        logger.info("'Chat with Digital Ray' button not found, continuing anyway "
+                    "(may have auto-redirected)")
+
+    # Step 4: Wait for the principlesyou.com login form to appear
+    logger.info("Waiting for principlesyou.com email form")
+    try:
         await page.wait_for_selector(EMAIL_INPUT, timeout=20000, state="visible")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Never reached principlesyou.com email form. Current URL: {page.url}"
+            f"Email form never appeared on principlesyou.com. "
+            f"Current URL: {page.url}"
         )
 
-    # The OneTrust cookie banner may be covering buttons - dismiss it
-    await _dismiss_cookie_banner(page)
-
-    # --- Step 4: tick Terms of Service checkbox (mandatory) ---
-    logger.info("Ticking Terms of Service checkbox")
-    try:
-        checkbox = page.locator('input[type="checkbox"]').first
-        if not await checkbox.is_checked():
-            await checkbox.check(timeout=5000)
-    except Exception as e:
-        logger.warning(f"Couldn't tick Terms checkbox (may not be required): {e}")
-
-    # --- Step 5: fill email and click CONTINUE ---
+    # Step 5: Fill email and click Continue (first time)
     logger.info("Filling email address")
     await page.fill(EMAIL_INPUT, settings.digitalray_email)
 
-    # Capture URL before submit so we can detect the navigation
-    url_before_email_submit = page.url
+    logger.info("Clicking Continue (email page, first click)")
+    await page.click(EMAIL_CONTINUE_BUTTON, timeout=10000)
 
-    logger.info("Clicking CONTINUE on email page")
-    await _click_continue(page)
-
-    # --- Step 6: wait for password page ---
-    # On principlesyou.com, the email and password forms share the same URL,
-    # so we can't wait for URL change. Instead, wait for the password field
-    # to become visible (it's not present on the email form).
-    logger.info("Waiting for password page to appear")
+    # Step 6: Tick the Terms of Service checkbox
+    # Axiom clicks Continue first, which reveals the Terms requirement.
+    # We give the page a moment to show the checkbox, then tick it.
+    await page.wait_for_timeout(1000)
+    logger.info("Ticking Terms of Service checkbox")
     try:
-        await page.wait_for_selector(PASSWORD_INPUT, timeout=15000, state="visible")
-        logger.info(f"Password page loaded. Current URL: {page.url}")
+        await page.check(TERMS_CHECKBOX, timeout=5000)
+    except Exception as e:
+        logger.warning(f"Couldn't tick Terms checkbox: {e}")
+
+    # Step 7: Click Continue again to submit the email + terms
+    logger.info("Clicking Continue (email page, second click after ticking Terms)")
+    await page.click(EMAIL_CONTINUE_BUTTON, timeout=10000)
+
+    # Step 8: Wait for the password page
+    logger.info("Waiting for password field")
+    try:
+        await page.wait_for_selector(PASSWORD_INPUT, timeout=20000, state="visible")
     except PlaywrightTimeout:
         raise RuntimeError(
-            f"Password page never appeared after email CONTINUE. "
-            f"Current URL: {page.url}."
+            f"Password field never appeared. Current URL: {page.url}"
         )
 
-    # --- Step 7: fill password and submit ---
-    logger.info("Filling password")
-    await page.fill(PASSWORD_INPUT, settings.digitalray_password)
+    # Step 9: Type the password with small keystroke delay (as Axiom does).
+    # The 3ms/keystroke delay helps avoid bot detection.
+    logger.info("Typing password (with keystroke delay)")
+    await page.click(PASSWORD_INPUT)  # focus the field first
+    await page.type(PASSWORD_INPUT, settings.digitalray_password, delay=3)
 
-    # Try submitting three different ways: press Enter, click CONTINUE, submit form.
-    # Whichever triggers navigation first wins.
-    logger.info("Submitting password - trying Enter key first")
-    try:
-        # Pressing Enter on the password field submits most HTML forms natively
-        await page.press(PASSWORD_INPUT, "Enter")
-    except Exception as e:
-        logger.warning(f"Enter press failed: {e}")
+    # Step 10: Click Continue on the password page
+    logger.info("Clicking Continue (password page)")
+    await page.click(PASSWORD_CONTINUE_BUTTON, timeout=10000)
 
-    # Give it a moment to start navigating
-    await page.wait_for_timeout(2000)
-
-    # If we're still on principlesyou.com and password field still visible,
-    # the Enter didn't work - try clicking CONTINUE
-    if "principlesyou.com" in page.url:
-        try:
-            still_on_password = await page.locator(PASSWORD_INPUT).is_visible(timeout=1000)
-        except Exception:
-            still_on_password = False
-        if still_on_password:
-            logger.info("Enter didn't submit - trying CONTINUE click")
-            try:
-                await _click_continue(page)
-            except Exception as e:
-                logger.warning(f"CONTINUE click failed too: {e}")
-
-            # If still stuck, try direct form submission via JS
-            await page.wait_for_timeout(2000)
-            try:
-                still_on_password = await page.locator(PASSWORD_INPUT).is_visible(timeout=1000)
-            except Exception:
-                still_on_password = False
-            if still_on_password:
-                logger.info("Click didn't submit either - trying form.submit() via JS")
-                try:
-                    await page.evaluate("""
-                        () => {
-                            const pwd = document.querySelector('input[type="password"]');
-                            if (pwd && pwd.form) pwd.form.submit();
-                        }
-                    """)
-                except Exception as e:
-                    logger.warning(f"JS form.submit() failed: {e}")
-
-    # --- Step 8: wait for redirect to authenticated digitalray.ai ---
-    logger.info("Waiting for redirect to authenticated digitalray.ai")
+    # Step 11: Wait for redirect to authenticated digitalray.ai/home
+    logger.info("Waiting for redirect to digitalray.ai/home")
     try:
         await page.wait_for_url(
             lambda url: "digitalray.ai" in url
-                        and "/guest" not in url
-                        and "/login" not in url,
+                        and "/home" in url,
             timeout=30000,
         )
         await page.wait_for_load_state("networkidle", timeout=30000)
@@ -252,140 +156,93 @@ async def _log_in(page) -> None:
         # Diagnostic dump
         try:
             body_text = await page.locator("body").inner_text()
-            logger.error(f"Post-password page body: {body_text[:2000]}")
+            logger.error(f"Post-login page body (first 1500 chars): {body_text[:1500]}")
         except Exception:
             pass
         raise RuntimeError(
-            f"Password submit didn't redirect to authenticated digitalray.ai. "
-            f"Current URL: {page.url}. Possible causes: wrong password, 2FA "
-            f"required, email verification needed, or cookie banner blocking submit."
+            f"Login didn't redirect to digitalray.ai/home. Current URL: {page.url}. "
+            f"Possible causes: wrong credentials, 2FA, or email verification."
         )
 
     logger.info(f"Login successful. Current URL: {page.url}")
 
 
 async def _send_message_and_get_reply(page, message: str) -> str:
-    """Types the message, clicks send, waits for the streamed reply to complete."""
-    logger.info("Waiting for chat interface")
-    await page.wait_for_selector(CHAT_INPUT, timeout=20000)
+    """
+    Types the question, clicks send, waits 35 seconds, scrapes the reply.
+    Mirrors the Axiom approach: simple fixed wait instead of polling.
+    """
+    # Wait for the chat textarea to be visible
+    logger.info("Waiting for chat input textarea")
+    await page.wait_for_selector(CHAT_INPUT, timeout=20000, state="visible")
 
-    logger.info("Typing message")
+    # Type the message
+    logger.info("Typing question into chat")
     await page.fill(CHAT_INPUT, message)
 
+    # Click the send button
     logger.info("Clicking send")
-    await page.click(SEND_BUTTON)
+    await page.click(SEND_BUTTON, timeout=10000)
 
-    logger.info("Waiting for reply to finish streaming")
-    reply_text = await _wait_for_reply_to_stabilize(page)
+    # Wait 35 seconds for the reply to finish streaming (Axiom's approach)
+    logger.info("Waiting 35 seconds for AI reply to complete")
+    await page.wait_for_timeout(35000)
+
+    # Scrape the reply. Digital Ray renders replies in nested divs on /home.
+    # Strategy: grab all text elements, find the longest one that looks like
+    # an AI reply (longer than ~50 chars, not the question we asked).
+    logger.info("Scraping reply text")
+    reply_text = await _extract_latest_reply(page, user_message=message)
 
     if not reply_text:
         raise RuntimeError(
-            "Message sent but no reply detected. LATEST_REPLY_SELECTOR "
-            "may need to be updated."
+            "No reply text could be extracted from the page. The answer "
+            "selector may need adjustment."
         )
 
     logger.info(f"Got reply: {len(reply_text)} chars")
     return reply_text
 
 
-async def _wait_for_reply_to_stabilize(page, max_wait_seconds: int = 90) -> str:
+async def _extract_latest_reply(page, user_message: str) -> str:
     """
-    Polls the latest reply element every second. Returns once its text
-    stops changing for 2 consecutive seconds (meaning streaming finished).
+    Extracts the most recent AI reply from the chat page.
+
+    Strategy: scrape the full visible text of the chat area, then find the
+    block that comes AFTER our question. The last meaningful block of text
+    is the AI's reply.
     """
-    last_text = ""
-    stable_checks = 0
-    required_stable_checks = 2
-
-    for _ in range(max_wait_seconds):
-        await asyncio.sleep(1)
-
-        try:
-            elements = await page.query_selector_all(LATEST_REPLY_SELECTOR)
-            if not elements:
-                continue
-            current_text = (await elements[-1].inner_text()).strip()
-        except Exception:
-            continue
-
-        if current_text and current_text == last_text:
-            stable_checks += 1
-            if stable_checks >= required_stable_checks:
-                return current_text
-        else:
-            stable_checks = 0
-            last_text = current_text
-
-    return last_text
-
-
-async def _click_continue(page) -> None:
-    """
-    Clicks the 'CONTINUE' button on principlesyou.com login pages.
-
-    The button may be a <button>, an <input type=submit>, or a styled
-    element. We try several strategies in order.
-    """
-    # Give the form a moment to enable the button after filling the last field
-    await page.wait_for_timeout(500)
-
-    # Strategies from most-specific to most-permissive
-    strategies = [
-        page.get_by_role("button", name="Continue", exact=False),
-        page.locator('button:has-text("CONTINUE")'),
-        page.locator('button:has-text("Continue")'),
-        page.locator('input[type="submit"]'),
-        page.locator('[type="submit"]'),
-        page.get_by_text("CONTINUE", exact=True),
-        page.get_by_text("Continue", exact=True),
-        page.locator('a:has-text("CONTINUE"), a:has-text("Continue")'),
-    ]
-
-    last_error = None
-    for i, locator in enumerate(strategies):
-        try:
-            await locator.first.click(timeout=5000)
-            logger.info(f"Clicked CONTINUE using strategy #{i + 1}")
-            return
-        except Exception as e:
-            last_error = e
-            continue
-
-    # All strategies failed - dump body text for diagnostics
+    # Grab all text content from the page
     try:
-        body_text = await page.locator("body").inner_text()
-        logger.error(f"principlesyou.com page body text (first 2000 chars): {body_text[:2000]}")
-    except Exception:
-        pass
-    raise RuntimeError(
-        f"Couldn't click CONTINUE button on principlesyou.com. "
-        f"Current URL: {page.url}. Last error: {last_error}. "
-        f"See prior log line for visible page text."
-    )
+        # Target the main chat area - avoid sidebar and header
+        # The chat messages are usually in divs further down the DOM
+        full_text = await page.locator("body").inner_text()
+    except Exception as e:
+        logger.warning(f"Couldn't read page text: {e}")
+        return ""
 
+    # Split into lines and clean
+    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
 
-async def _dismiss_cookie_banner(page) -> None:
-    """
-    Dismisses the OneTrust cookie consent banner if visible.
-    Safe to call even if no banner exists.
-    """
-    banner_buttons = [
-        page.get_by_role("button", name="Reject All"),
-        page.get_by_role("button", name="Accept All"),
-        page.get_by_role("button", name="Ok"),
-        page.locator('#onetrust-reject-all-handler'),
-        page.locator('#onetrust-accept-btn-handler'),
-        page.locator('button:has-text("Reject All")'),
-        page.locator('button:has-text("Ok")'),
-    ]
-    for locator in banner_buttons:
-        try:
-            await locator.first.click(timeout=2000)
-            logger.info("Dismissed cookie banner")
-            await page.wait_for_timeout(500)
-            return
-        except Exception:
-            continue
-    # No banner found - that's fine
-    logger.info("No cookie banner to dismiss")
-    
+    # Find the line containing our question - the reply is after it
+    reply_lines = []
+    found_question = False
+    for line in lines:
+        if found_question:
+            # Stop if we hit a UI element (short lines, nav items)
+            if line in ("New Chat", "Principles", "My Principles", "Chat History",
+                        "Ask me anything", "Type Your Questions Here"):
+                break
+            reply_lines.append(line)
+        elif user_message.lower() in line.lower() and len(line) < len(user_message) + 50:
+            found_question = True
+
+    if reply_lines:
+        return "\n".join(reply_lines).strip()
+
+    # Fallback: return the longest line on the page that isn't a nav item
+    candidates = [line for line in lines if len(line) > 100]
+    if candidates:
+        return max(candidates, key=len)
+
+    return ""

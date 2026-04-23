@@ -242,43 +242,135 @@ async def _send_message_and_get_reply(page, message: str) -> str:
 
 async def _extract_latest_reply(page, user_message: str) -> str:
     """
-    Extracts the most recent AI reply from the chat page.
-
-    Strategy: scrape the full visible text of the chat area, then find the
-    block that comes AFTER our question. The last meaningful block of text
-    is the AI's reply.
+    Extracts ONLY the AI analysis text from the chat page, stripping out
+    UI chrome (header, echoed question, sources list, disclaimer, suggested
+    follow-ups, footer, voice chat button).
     """
-    # Grab all text content from the page
+    # Get the full visible text of the page
     try:
-        # Target the main chat area - avoid sidebar and header
-        # The chat messages are usually in divs further down the DOM
         full_text = await page.locator("body").inner_text()
     except Exception as e:
         logger.warning(f"Couldn't read page text: {e}")
         return ""
 
-    # Split into lines and clean
-    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+    # Split into non-empty lines
+    all_lines = [line.strip() for line in full_text.split("\n") if line.strip()]
 
-    # Find the line containing our question - the reply is after it
-    reply_lines = []
-    found_question = False
-    for line in lines:
-        if found_question:
-            # Stop if we hit a UI element (short lines, nav items)
-            if line in ("New Chat", "Principles", "My Principles", "Chat History",
-                        "Ask me anything", "Type Your Questions Here"):
-                break
-            reply_lines.append(line)
-        elif user_message.lower() in line.lower() and len(line) < len(user_message) + 50:
-            found_question = True
+    # --- Strategy 1: Use the disclaimer line as the END marker ---
+    # The disclaimer appears right after the analysis and is very distinctive.
+    end_markers = [
+        "This response includes information from external sources",
+        "may contain inaccuracies",
+    ]
+    end_idx = None
+    for i, line in enumerate(all_lines):
+        if any(marker in line for marker in end_markers):
+            end_idx = i
+            break
 
-    if reply_lines:
-        return "\n".join(reply_lines).strip()
+    # --- Strategy 2: Find the START of the analysis ---
+    # The analysis starts AFTER the sources list. Sources are lines that
+    # look like URLs or site domains. We walk forward past them.
+    #
+    # We also skip the echoed user question and any UI text before it.
+    start_idx = None
 
-    # Fallback: return the longest line on the page that isn't a nav item
-    candidates = [line for line in lines if len(line) > 100]
-    if candidates:
-        return max(candidates, key=len)
+    # First, locate the echoed question line
+    question_idx = None
+    user_msg_lower = user_message.lower().strip()
+    for i, line in enumerate(all_lines):
+        # Match when the line IS the question (not when it merely contains it)
+        # and is short enough to be the echo (not the analysis itself)
+        line_lower = line.lower().strip()
+        if user_msg_lower in line_lower and len(line) < len(user_message) + 30:
+            question_idx = i
+            break
+
+    if question_idx is not None:
+        # After the question comes the source list. Walk forward until we
+        # find the first line that looks like PROSE (not a URL, not a title
+        # of a source article with a domain immediately after it).
+        for i in range(question_idx + 1, end_idx or len(all_lines)):
+            line = all_lines[i]
+            # Skip lines that look like URLs (domain names)
+            if _looks_like_url_or_domain(line):
+                continue
+            # Skip short lines that look like source article titles
+            # (titles are usually followed by a domain line on the next line)
+            if i + 1 < len(all_lines) and _looks_like_url_or_domain(all_lines[i + 1]):
+                continue
+            # Found the first prose line - this is where the analysis starts
+            start_idx = i
+            break
+
+    # --- If both markers found, extract cleanly ---
+    if start_idx is not None and end_idx is not None and end_idx > start_idx:
+        analysis_lines = all_lines[start_idx:end_idx]
+        cleaned = "\n".join(analysis_lines).strip()
+        if len(cleaned) > 100:  # sanity check
+            logger.info(f"Extracted analysis via markers: {len(cleaned)} chars")
+            return cleaned
+
+    # --- Fallback: return the longest paragraph-like block ---
+    # This handles cases where markers shifted or are missing.
+    logger.warning("Marker-based extraction failed - using longest-block fallback")
+
+    # Exclude lines that are obviously UI chrome
+    ui_chrome_patterns = (
+        "Hello,", "How can I help", "Voice Chat with",
+        "DigitalRay may produce", "Feel free to ask",
+        "This response includes", "Type Your Questions",
+        "New Chat", "Chat History", "My Principles",
+    )
+    candidate_lines = []
+    for line in all_lines:
+        if any(pat in line for pat in ui_chrome_patterns):
+            continue
+        if _looks_like_url_or_domain(line):
+            continue
+        if user_msg_lower in line.lower() and len(line) < len(user_message) + 30:
+            continue  # echoed question
+        candidate_lines.append(line)
+
+    # Join consecutive non-short lines (the analysis is a contiguous block)
+    # and return the longest such block
+    blocks = []
+    current_block = []
+    for line in candidate_lines:
+        if len(line) > 50:  # analysis paragraphs are long
+            current_block.append(line)
+        else:
+            if current_block:
+                blocks.append("\n".join(current_block))
+                current_block = []
+    if current_block:
+        blocks.append("\n".join(current_block))
+
+    if blocks:
+        longest = max(blocks, key=len)
+        logger.info(f"Extracted analysis via fallback (longest block): {len(longest)} chars")
+        return longest
+
+    # Last resort: return everything after the question, before the disclaimer
+    if question_idx is not None and end_idx is not None:
+        raw = "\n".join(all_lines[question_idx + 1 : end_idx]).strip()
+        logger.warning(f"Using last-resort extraction: {len(raw)} chars")
+        return raw
 
     return ""
+
+
+def _looks_like_url_or_domain(line: str) -> bool:
+    """Heuristic: is this line a URL or a bare domain like 'www.example.com'?"""
+    if not line:
+        return False
+    line_lower = line.lower().strip()
+    # Full URLs
+    if line_lower.startswith(("http://", "https://", "www.")):
+        return True
+    # Bare domains ending in a common TLD and without spaces
+    if " " not in line_lower and "." in line_lower:
+        for tld in (".com", ".ai", ".org", ".co", ".net", ".io", ".gov", ".edu"):
+            if line_lower.endswith(tld) or line_lower.endswith(tld + "/"):
+                return True
+    return False
